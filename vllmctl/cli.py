@@ -4,6 +4,13 @@ from vllmctl.core.vllm_probe import list_local_models, get_listening_ports, ping
 from vllmctl.core.ssh_utils import parse_ssh_config, list_remote_models, run_ssh_command
 from vllmctl.core.forward import auto_forward_ports
 from vllmctl.core.launcher import launch_vllm
+from vllmctl.core.async_utils import (
+    parallel_ping_vllm_ports, 
+    parallel_check_remote_servers,
+    parallel_gpu_scan,
+    parallel_vllm_metrics,
+    parallel_auto_forward
+)
 from rich.progress import track
 from rich.table import Table
 from rich.console import Console
@@ -23,13 +30,13 @@ app = typer.Typer()
 @app.command()
 def list_local():
     """Show local vllm-models (by ports, including forwarded)."""
+    console = Console()
     ports = get_listening_ports()
     tmux_sessions = get_tmux_sessions()
-    models = {}
-    for port in track(ports, description="Checking ports..."):
-        info = ping_vllm(port)
-        if info:
-            models[port] = info
+    
+    # Используем параллельную проверку портов
+    models = parallel_ping_vllm_ports(ports)
+    
     table = Table(title="Local vllm models")
     table.add_column("Server")
     table.add_column("Remote\nport")
@@ -62,7 +69,6 @@ def list_local():
                         status = f"tmux: {tmux_name}"
                         break
             table.add_row(server, remote_port, local_port, status, model_name)
-    console = Console()
     console.print(table)
 
 @app.command()
@@ -72,30 +78,25 @@ def list_remote(
     remote_port: int = typer.Option(8000, help="Port for checking on remote servers (default 8000)")
 ):
     """Show vllm-models on all servers from ssh-config."""
+    console = Console()
     hosts = parse_ssh_config()
     if host_regex:
         hosts = [h for h in hosts if regexlib.search(host_regex, h)]
     if not hosts:
         typer.echo("No suitable hosts in ~/.ssh/config")
         return
+        
+    # Используем параллельную проверку серверов
+    results = parallel_check_remote_servers(hosts, remote_port, debug)
+    
     table = Table(title="Remote vllm models")
     table.add_column("Server")
     table.add_column("Remote\nport")
     table.add_column("Model")
-    for host in track(hosts, description="Checking servers..."):
-        try:
-            models = list_remote_models(host, port=remote_port)
-        except Exception as e:
-            if debug:
-                table.add_row(host, str(remote_port), f"Error: {e}")
-            continue
-        if models:
-            for port, info in models.items():
-                model_name = info['data'][0]['id'] if info.get('data') and info['data'] else 'unknown'
-                table.add_row(host, str(port), model_name)
-        elif debug:
-            table.add_row(host, str(remote_port), "-")
-    console = Console()
+    
+    for host, port, model_name, error in results:
+        table.add_row(host, str(port), model_name)
+    
     console.print(table)
 
 @app.command()
@@ -107,6 +108,7 @@ def auto_forward(
     debug: bool = typer.Option(False, help="Detailed output")
 ):
     """Automatically forward ports with models to local machine."""
+    console = Console()
     hosts = parse_ssh_config()
     if host_regex:
         hosts = [h for h in hosts if regexlib.search(host_regex, h)]
@@ -119,6 +121,11 @@ def auto_forward(
     except Exception:
         typer.echo("Error in local_range format. Example: 16100-16199")
         return
+        
+    # Используем параллельную проверку серверов для определения наличия моделей
+    host_model_data = parallel_auto_forward(hosts, remote_port, local_range_tuple, no_kill, debug)
+    
+    # Теперь обрабатываем результаты и выполняем форвардинг
     results = auto_forward_ports(
         hosts,
         remote_port=remote_port,
@@ -145,7 +152,6 @@ def auto_forward(
             status,
             model if (show_model and model) else "-"
         )
-    console = Console()
     console.print(table)
 
 @app.command()
@@ -181,40 +187,67 @@ def tmux_forwards(
     tmux_prefix: str = typer.Option("vllmctl_", help="Prefix for tmux sessions to search for forwards")
 ):
     """Show all tmux-forwards (vllmctl_*) and status: is there a model on the port. Only parses session names."""
+    console = Console()
     result = subprocess.run(["tmux", "ls"], capture_output=True, text=True)
     sessions = []
+    local_ports = []
+    session_data = {}
+    
     for line in result.stdout.splitlines():
         if line.startswith(tmux_prefix):
             name = line.split(':')[0]
             sessions.append(name)
+            # Parse session name: vllmctl_{host}_{remote_port}_{local_port}
+            m = regexlib.match(r"vllmctl_(.+)_(\d+)_(\d+)", name)
+            if m:
+                server = m.group(1)
+                remote_port = m.group(2)
+                local_port = int(m.group(3))
+                local_ports.append(local_port)
+                session_data[local_port] = {
+                    'session': name,
+                    'server': server,
+                    'remote_port': remote_port
+                }
+    
+    # Параллельно проверяем все локальные порты
+    if local_ports:
+        models_dict = parallel_ping_vllm_ports(local_ports)
+    else:
+        models_dict = {}
+    
     table = Table(title="Tmux-forwards status")
     table.add_column("Tmux session")
     table.add_column("Server")
     table.add_column("Remote port")
     table.add_column("Local port")
     table.add_column("Model on port?")
+    
     for session in sessions:
         # Parse session name: vllmctl_{host}_{remote_port}_{local_port}
         m = regexlib.match(r"vllmctl_(.+)_(\d+)_(\d+)", session)
         if m:
             server = m.group(1)
             remote_port = m.group(2)
-            local_port = m.group(3)
+            local_port = int(m.group(3))
+            
+            # Используем результаты параллельной проверки
             model_status = "-"
-            try:
-                model_info = ping_vllm(int(local_port))
+            if local_port in models_dict:
+                model_info = models_dict[local_port]
                 if model_info and 'data' in model_info and model_info['data']:
                     model_status = model_info['data'][0].get('id', 'model exists')
                 elif model_info:
                     model_status = 'model exists'
                 else:
                     model_status = "no model"
-            except Exception:
-                model_status = "error"
-            table.add_row(session, server, remote_port, local_port, model_status)
+            else:
+                model_status = "no model"
+                
+            table.add_row(session, server, remote_port, str(local_port), model_status)
         else:
             table.add_row(session, "-", "-", "-", "invalid session name")
-    console = Console()
+    
     console.print(table)
 
 @app.command()
@@ -289,14 +322,19 @@ def vllm_queue_top(
     """Show real-time vLLM queue status for all local ports (like nvtop)."""
     console = Console()
     ports = get_listening_ports()
-    vllm_ports = []
+    
+    # Используем параллельное сканирование для первоначального поиска vLLM портов
+    models_dict = parallel_ping_vllm_ports(ports)
+    vllm_ports = list(models_dict.keys())
     port_models = {}
-    # Scan all ports once with a progress bar
-    for port in track(ports, description="Scanning ports for vLLM models..."):
-        info = ping_vllm(port)
+    
+    for port in vllm_ports:
+        info = models_dict[port]
         if info and 'data' in info and info['data']:
-            vllm_ports.append(port)
             port_models[port] = info['data'][0].get('id', '-')
+        else:
+            port_models[port] = '-'
+    
     if not vllm_ports:
         console.print("No running vLLM instances found on local ports.")
         return
@@ -413,11 +451,31 @@ def gpu_idle_top(
     if not hosts:
         console.print("No hosts found in ssh config.")
         return
+    
     spinner_frames = ['|', '/', '-', '\\']
     spinner_idx = [0]
     util_history = {host: [] for host in hosts}
     mem_history = {host: [] for host in hosts}
+
+    # Начальное параллельное сканирование с прогресс-баром
+    gpu_stats = parallel_gpu_scan(hosts)
+    
     reachable_hosts = []
+    for host, (util, mem) in gpu_stats.items():
+        if util is not None:
+            util_history[host].append(util)
+        if mem is not None:
+            mem_history[host].append(mem)
+        if util is not None or mem is not None:
+            reachable_hosts.append(host)
+        else:
+            util_history[host] = []
+            mem_history[host] = []
+
+    # Only keep reachable hosts for live updates
+    hosts = reachable_hosts
+    util_history = {h: util_history[h] for h in hosts}
+    mem_history = {h: mem_history[h] for h in hosts}
 
     def get_gpu_stats(host):
         try:
@@ -448,25 +506,6 @@ def gpu_idle_top(
             idx = int((v - minv) / (maxv - minv) * (len(chars) - 1))
             res += chars[idx]
         return res.rjust(width)
-
-    # Initial scan with progress bar
-    for host in track(hosts, description="Scanning GPU utilization on hosts..."):
-        util, mem = get_gpu_stats(host)
-        if util is not None:
-            util_history[host].append(util)
-        if mem is not None:
-            mem_history[host].append(mem)
-        if util is not None or mem is not None:
-            reachable_hosts.append(host)
-        else:
-            # Show unreachable hosts in initial scan as '-'
-            util_history[host] = []
-            mem_history[host] = []
-
-    # Only keep reachable hosts for live updates
-    hosts = reachable_hosts
-    util_history = {h: util_history[h] for h in hosts}
-    mem_history = {h: mem_history[h] for h in hosts}
 
     def color_value(val):
         if val is None:
