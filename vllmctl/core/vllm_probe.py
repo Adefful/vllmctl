@@ -6,7 +6,8 @@ import sys
 
 TMUX_PREFIX = "vllmctl_"
 
-def get_listening_ports():
+# --- platform-specific listening ports ---
+def get_listening_ports_linux():
     try:
         result = subprocess.run([
             "ss", "-tulpen"
@@ -26,6 +27,13 @@ def get_listening_ports():
     except Exception as e:
         print(f"[vllmctl] Error running 'ss': {e}")
         return []
+
+def get_listening_ports():
+    if sys.platform == "darwin":
+        from .platform_mac import get_listening_ports as get_listening_ports_mac
+        return get_listening_ports_mac()
+    else:
+        return get_listening_ports_linux()
 
 def ping_vllm(port):
     try:
