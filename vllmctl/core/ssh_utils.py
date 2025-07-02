@@ -22,7 +22,7 @@ def parse_ssh_config():
 def run_ssh_command(host: str, command: str, timeout=5) -> str:
     try:
         result = subprocess.run([
-            "ssh", host, command
+            "ssh", "-o", "BatchMode=yes", host, command
         ], capture_output=True, text=True, timeout=timeout)
         return result.stdout
     except Exception as e:
