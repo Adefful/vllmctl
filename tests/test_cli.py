@@ -39,19 +39,19 @@ def fake_subprocess_run(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
 
 
-def test_launch_success():
+def test_serve_success():
     result = runner.invoke(app, [
-        "launch", "--server", "server1", "--model", "Qwen/Qwen2.5-Coder-32B-Instruct", "--timeout", "2"
+        "serve", "--server", "server1", "--model", "Qwen/Qwen2.5-Coder-32B-Instruct", "--timeout", "2"
     ])
     assert result.exit_code == 0
     assert "✓ VLLM is ready!" in result.output
     assert "tmux attach -t vllmctl_server_8000" in result.output
 
 
-def test_launch_timeout(monkeypatch):
+def test_serve_timeout(monkeypatch):
     monkeypatch.setattr("requests.get", lambda *a, **kw: (_ for _ in ()).throw(Exception("fail")))
     result = runner.invoke(app, [
-        "launch", "--server", "server1", "--model", "Qwen/Qwen2.5-Coder-32B-Instruct", "--timeout", "1"])
+        "serve", "--server", "server1", "--model", "Qwen/Qwen2.5-Coder-32B-Instruct", "--timeout", "1"])
     assert result.exit_code != 0
     assert "VLLM API did not start" in result.output
 

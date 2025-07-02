@@ -17,6 +17,7 @@ from rich.live import Live
 import re
 import numpy as np
 from rich.text import Text
+from vllmctl.core.parallel_utils import parallel_map_with_progress
 
 app = typer.Typer()
 
@@ -26,8 +27,13 @@ def list_local():
     ports = get_listening_ports()
     tmux_sessions = get_tmux_sessions()
     models = {}
-    for port in track(ports, description="Checking ports..."):
-        info = ping_vllm(port)
+
+    def check_port(port):
+        return port, ping_vllm(port)
+
+    results = parallel_map_with_progress(check_port, ports, description="Checking ports...")
+
+    for port, info in results:
         if info:
             models[port] = info
     table = Table(title="Local vllm models")
@@ -78,16 +84,24 @@ def list_remote(
     if not hosts:
         typer.echo("No suitable hosts in ~/.ssh/config")
         return
+
     table = Table(title="Remote vllm models")
     table.add_column("Server")
     table.add_column("Remote\nport")
     table.add_column("Model")
-    for host in track(hosts, description="Checking servers..."):
+    def check_host(host):
         try:
             models = list_remote_models(host, port=remote_port)
+            return (host, models, None)
         except Exception as e:
+            return (host, None, e)
+
+    results = parallel_map_with_progress(check_host, hosts, description="Checking servers...")
+
+    for host, models, error in results:
+        if error:
             if debug:
-                table.add_row(host, str(remote_port), f"Error: {e}")
+                table.add_row(host, str(remote_port), f"Error: {error}")
             continue
         if models:
             for port, info in models.items():
@@ -337,7 +351,7 @@ def kill_tmux(
 
 @app.command()
 def vllm_queue_top(
-    refresh: float = typer.Option(1.0, help="Refresh interval in seconds"),
+    refresh: float = typer.Option(10.0, help="Refresh interval in seconds"),
     history: int = typer.Option(30, help="Number of points for mini-graph (history)")
 ):
     """Show real-time vLLM queue status for all local ports (like nvtop)."""
@@ -483,11 +497,17 @@ def gpu_idle_top(
                 parts = [int(x) for x in line.strip().split(',') if x.strip().isdigit()]
                 if len(parts) == 2 and parts[1] > 0:
                     mems.append(parts[0] / parts[1] * 100)
+            # Получаем количество GPU
+            out_count = run_ssh_command(host, "nvidia-smi -L | wc -l", timeout=3)
+            try:
+                gpu_count = int(out_count.strip())
+            except Exception:
+                gpu_count = None
             avg_util = float(np.mean(utils)) if utils else None
             avg_mem = float(np.mean(mems)) if mems else None
-            return avg_util, avg_mem
+            return avg_util, avg_mem, gpu_count
         except Exception:
-            return None, None
+            return None, None, None
 
     def sparkline(data, width=history):
         if not data:
@@ -504,8 +524,13 @@ def gpu_idle_top(
         return res.rjust(width)
 
     # Initial scan with progress bar
-    for host in track(hosts, description="Scanning GPU utilization on hosts..."):
-        util, mem = get_gpu_stats(host)
+    def get_stats_for_init(host):
+        util, mem, gpu_count = get_gpu_stats(host)
+        return host, util, mem, gpu_count
+
+    results = parallel_map_with_progress(get_stats_for_init, hosts, description="Scanning GPU utilization on hosts...", show_progress=True)
+    gpu_counts = {}
+    for host, util, mem, gpu_count in results:
         if util is not None:
             util_history[host].append(util)
         if mem is not None:
@@ -513,9 +538,9 @@ def gpu_idle_top(
         if util is not None or mem is not None:
             reachable_hosts.append(host)
         else:
-            # Show unreachable hosts in initial scan as '-'
             util_history[host] = []
             mem_history[host] = []
+        gpu_counts[host] = gpu_count
 
     # Only keep reachable hosts for live updates
     hosts = reachable_hosts
@@ -544,11 +569,16 @@ def gpu_idle_top(
         table.add_column("Util (%)")
         table.add_column("Util Graph")
         table.add_column("Mem (%)")
-        table.add_column("Mem Graph")
+        table.add_column("GPU count")
         # Sort hosts by last utilization (lowest first, None last)
         sorted_hosts = sorted(hosts, key=lambda h: (util_history[h][-1] if util_history[h] else float('inf')))
-        for host in sorted_hosts:
-            util, mem = get_gpu_stats(host)
+
+        def get_stats_for_table(host):
+            util, mem, gpu_count = get_gpu_stats(host)
+            return host, util, mem, gpu_count
+
+        results = parallel_map_with_progress(get_stats_for_table, sorted_hosts, description=None, max_workers=16, show_progress=False)
+        for host, util, mem, gpu_count in results:
             if util is not None:
                 util_history[host].append(util)
                 if len(util_history[host]) > history:
@@ -557,12 +587,13 @@ def gpu_idle_top(
                 mem_history[host].append(mem)
                 if len(mem_history[host]) > history:
                     mem_history[host] = mem_history[host][-history:]
+            gpu_counts[host] = gpu_count
             table.add_row(
                 host,
                 color_value(util),
                 sparkline(util_history[host]),
                 color_value(mem),
-                sparkline(mem_history[host])
+                str(gpu_count) if gpu_count is not None else "-"
             )
         return table
 
