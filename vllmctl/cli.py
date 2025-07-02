@@ -360,11 +360,18 @@ def vllm_queue_top(
     vllm_ports = []
     port_models = {}
     # Scan all ports once with a progress bar
-    for port in track(ports, description="Scanning ports for vLLM models..."):
+    def check_vllm_port(port):
         info = ping_vllm(port)
         if info and 'data' in info and info['data']:
+            return port, info['data'][0].get('id', '-')
+        return None
+
+    results = parallel_map_with_progress(check_vllm_port, ports, description="Scanning ports for vLLM models...", show_progress=True)
+    for result in results:
+        if result:
+            port, model_name = result
             vllm_ports.append(port)
-            port_models[port] = info['data'][0].get('id', '-')
+            port_models[port] = model_name
     if not vllm_ports:
         console.print("No running vLLM instances found on local ports.")
         return
@@ -438,9 +445,14 @@ def vllm_queue_top(
         table.add_column("Run graph")
         table.add_column("Prompt TPT")
         table.add_column("Gen TPT")
-        for port in vllm_ports:
+
+        def get_metrics_for_port(port):
+            return port, get_metrics(port)
+
+        results = parallel_map_with_progress(get_metrics_for_port, vllm_ports, description=None, show_progress=False)
+        for port, metrics in results:
+            waiting, running, swapped, prompt_throughput, generation_throughput = metrics
             model = port_models.get(port, '-')
-            waiting, running, swapped, prompt_throughput, generation_throughput = get_metrics(port)
             # Update history
             for key, val in zip(['waiting', 'running', 'prompt_throughput', 'generation_throughput'], [waiting, running, prompt_throughput, generation_throughput]):
                 if val is not None:
