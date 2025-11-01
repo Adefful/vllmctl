@@ -15,7 +15,7 @@ import threading
 import time as time_mod
 from rich.live import Live
 import re
-import numpy as np
+import statistics
 from rich.text import Text
 
 app = typer.Typer()
@@ -483,8 +483,8 @@ def gpu_idle_top(
                 parts = [int(x) for x in line.strip().split(',') if x.strip().isdigit()]
                 if len(parts) == 2 and parts[1] > 0:
                     mems.append(parts[0] / parts[1] * 100)
-            avg_util = float(np.mean(utils)) if utils else None
-            avg_mem = float(np.mean(mems)) if mems else None
+            avg_util = float(statistics.fmean(utils)) if utils else None
+            avg_mem = float(statistics.fmean(mems)) if mems else None
             return avg_util, avg_mem
         except Exception:
             return None, None

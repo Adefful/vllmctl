@@ -5,18 +5,25 @@ from typing import List, Dict, Optional
 
 SSH_CONFIG_PATH = os.path.expanduser("~/.ssh/config")
 
-def parse_ssh_config():
+def parse_ssh_config(conf_path=SSH_CONFIG_PATH):
     """Returns a list of hosts from the ssh-config."""
     hosts = []
-    if not os.path.exists(SSH_CONFIG_PATH):
+    if not os.path.exists(conf_path):
         return hosts
-    with open(SSH_CONFIG_PATH) as f:
+    with open(conf_path) as f:
         for line in f:
             line = line.strip()
             if line.lower().startswith('host '):
                 for h in line[5:].split():
                     if h != '*' and not h.startswith('?'):
                         hosts.append(h)
+            elif line.lower().startswith('include '):
+                include_path = os.path.expanduser(line[8:])
+                if not include_path.startswith('/'):
+                    include_path = os.path.expanduser(f"~/.ssh/{include_path}")
+
+                inc_hosts = parse_ssh_config(include_path)
+                hosts.extend(inc_hosts)
     return hosts
 
 def run_ssh_command(host: str, command: str, timeout=5) -> str:
